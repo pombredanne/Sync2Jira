@@ -21,16 +21,21 @@
 
 Run with systemd, please.
 """
-
+# Build-In Modules
 import logging
 import warnings
 import traceback
 from time import sleep
+import requests
+from copy import deepcopy
 
+# 3rd Part Modules
 import fedmsg
 import fedmsg.config
 import jinja2
+from requests_kerberos import HTTPKerberosAuth, OPTIONAL
 
+# Local Modules
 import sync2jira.upstream_issue as u_issue
 import sync2jira.upstream_pr as u_pr
 import sync2jira.downstream_issue as d_issue
@@ -91,6 +96,7 @@ pr_handlers = {
     'pagure.pull-request.comment.added': u_pr.handle_pagure_message,
     'pagure.pull-request.initial_comment.edited': u_pr.handle_pagure_message,
 }
+DATAGREPPER_URL = "https://datagrepper.engineering.redhat.com/raw"
 
 
 def load_config(loader=fedmsg.config.load_config):
@@ -293,6 +299,78 @@ def initialize_pr(config, testing=False):
     log.info("Done with github PR initialization.")
 
 
+def initialize_recent(config):
+    """
+    Initializes based on the recent history of datagrepper
+
+    :param Dict config: Config dict
+    :return: Nothing
+    """
+    mapping = config['sync2jira']['map']
+
+    # Query datagrepper
+    ret = query(categories=['github', 'pagure'], delta=int(600), rows_per_page=100)
+
+    # Loop and sync
+    for entry in ret:
+        import pdb; pdb.set_trace()
+
+
+def query(limit=None, **kwargs):
+    """
+    Run query on Datagrepper
+
+    Args:
+        limit: the max number of messages to fetch at a time
+        kwargs: keyword arguments to build request parameters
+    """
+    # Pack up the kwargs into a parameter list for request
+    params = deepcopy(kwargs)
+
+    # Set up for paging requests
+    all_results = []
+    page = params.get('page', 1)
+
+    # Important to set ASC order when paging to avoid duplicates
+    params['order'] = 'asc'
+
+    results = get(params=params)
+
+    # Collect the messages
+    all_results.extend(results['raw_messages'])
+
+    # Set up for loop
+    fetched = results['count']
+    total = limit or results['total']
+
+    # Fetch results until no more are left
+    while fetched < total:
+        page += 1
+        params['page'] = page
+
+        results = get(params=params)
+        count = results['count']
+        fetched += count
+
+        # if we missed the condition and haven't fetched any
+        if count == 0:
+            break
+
+        all_results.extend(results['raw_messages'])
+
+    return all_results
+
+
+def get(params):
+    url = DATAGREPPER_URL
+    headers = {'Accept': 'application/json', }
+
+    response = requests.get(url=url, params=params, headers=headers,
+                            auth=HTTPKerberosAuth(mutual_authentication=OPTIONAL))
+
+    return response.json()
+
+
 def main(runtime_test=False, runtime_config=None):
     """
     Main function to check for initial sync
@@ -314,12 +392,17 @@ def main(runtime_test=False, runtime_config=None):
 
     try:
         if config['sync2jira'].get('initialize'):
+            # Initialize issues
             log.info("Initializing Issues...")
             initialize_issues(config)
             log.info("Initializing PRs...")
             initialize_pr(config)
             if runtime_test:
                 return
+        else:
+            # Pool datagrepper from the last 10 mins
+            log.info("Initialization False. Pulling data from datagrepper...")
+            initialize_recent(config)
         try:
             listen(config)
         except KeyboardInterrupt:
